@@ -443,6 +443,10 @@ mod tests {
     const NOTIFICATION: &str =
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
     const REQUEST_ID: u64 = 7;
+    /// The server is in-process on loopback and answers every connection on its
+    /// own thread, so the only thing this has to catch is a transport that never
+    /// responds at all.
+    const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(5);
     const RESPONSE_EVENT: &str =
         "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
     const STALE_RESPONSE_EVENT: &str =
@@ -478,61 +482,68 @@ mod tests {
 
     fn spawn_server<F>(make_handler: impl FnOnce(String) -> F) -> String
     where
-        F: Fn(&Req) -> (u16, String) + Send + 'static,
+        F: Fn(&Req) -> (u16, String) + Send + Sync + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let handler = make_handler(base.clone());
+        let handler = Arc::new(make_handler(base.clone()));
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
+                let handler = Arc::clone(&handler);
+                // Serve every connection on its own thread instead of serially:
+                // the serial loop blocks in `read_line` on whatever it accepted,
+                // so a connection opened without a request written on it yet
+                // (the OAuth flow opens several in a row) parks the loop forever
+                // and the real request is never accepted.
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
 
-                if reader.read_line(&mut line).is_err() || line.is_empty() {
-                    continue;
-                }
-
-                let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let mut auth = None;
-                let mut protocol = None;
-                let mut content_length = 0usize;
-
-                loop {
-                    let mut header = String::new();
-
-                    if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
-                        break;
+                    if reader.read_line(&mut line).is_err() || line.is_empty() {
+                        return;
                     }
 
-                    let lower = header.to_ascii_lowercase();
+                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let mut auth = None;
+                    let mut protocol = None;
+                    let mut content_length = 0usize;
 
-                    if let Some(v) = lower.strip_prefix("authorization:") {
-                        let start = header.len() - v.len();
-                        auth = Some(header[start..].trim().to_string());
-                    } else if let Some(v) = lower.strip_prefix("content-length:") {
-                        content_length = v.trim().parse().unwrap_or(0);
-                    } else if let Some(v) = lower.strip_prefix("mcp-protocol-version:") {
-                        protocol = Some(v.trim().to_string());
+                    loop {
+                        let mut header = String::new();
+
+                        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                            break;
+                        }
+
+                        let lower = header.to_ascii_lowercase();
+
+                        if let Some(v) = lower.strip_prefix("authorization:") {
+                            let start = header.len() - v.len();
+                            auth = Some(header[start..].trim().to_string());
+                        } else if let Some(v) = lower.strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        } else if let Some(v) = lower.strip_prefix("mcp-protocol-version:") {
+                            protocol = Some(v.trim().to_string());
+                        }
                     }
-                }
 
-                let mut body = vec![0u8; content_length];
-                let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                    let mut body = vec![0u8; content_length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
 
-                let (status, resp_body) = handler(&Req {
-                    path,
-                    auth,
-                    protocol,
+                    let (status, resp_body) = handler(&Req {
+                        path,
+                        auth,
+                        protocol,
+                    });
+
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
                 });
-
-                let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
-                    resp_body.len(),
-                );
-
-                let _ = stream.write_all(response.as_bytes());
             }
         });
         base
@@ -560,7 +571,7 @@ mod tests {
         headers: HashMap<String, String>,
         storage: Option<StateDir>,
     ) -> HttpTransport {
-        HttpTransport::new("srv", url, &headers, Duration::from_secs(5), storage).unwrap()
+        HttpTransport::new("srv", url, &headers, TRANSPORT_TIMEOUT, storage).unwrap()
     }
 
     fn oauth_routes(base: &str, req: &Req) -> Option<(u16, String)> {
